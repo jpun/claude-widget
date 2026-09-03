@@ -1,0 +1,11 @@
+# 빌드 결과
+dist/
+build/
+*.spec
+
+# 실행하면 생기는 것
+ctx_widget.state.json
+*.log
+
+__pycache__/
+*.py[cod]
