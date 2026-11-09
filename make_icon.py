@@ -1,4 +1,4 @@
-"""Draw ctx_widget.ico - a context ring, matching the widget's palette.
+"""Draw claude_widget.ico - a context ring, matching the widget's palette.
 
 Run once after changing the design:
 
@@ -15,7 +15,7 @@ TRACK = "#3a3a3a"
 FILL = "#4ec9a0"
 RING_FRACTION = 0.68  # how much of the ring is filled, purely cosmetic
 
-OUTPUT = Path(__file__).with_name("ctx_widget.ico")
+OUTPUT = Path(__file__).with_name("claude_widget.ico")
 
 
 def main() -> None:

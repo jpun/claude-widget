@@ -1,8 +1,8 @@
-"""Build the standalone ClaudeContextWidget.exe.
+"""Build the standalone ClaudeWidget.exe.
 
     python build_exe.py
 
-Produces dist/ClaudeContextWidget.exe and removes the build scratch.
+Produces dist/ClaudeWidget.exe and removes the build scratch.
 
 One file on purpose - one thing to copy, nothing to keep together. The cost is
 startup: the exe unpacks itself into a temp directory on every launch, about
@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).parent
-ICON = HERE / "ctx_widget.ico"
+ICON = HERE / "claude_widget.ico"
 DIST = HERE / "dist"
 WORK = HERE / "build"
 
@@ -37,20 +37,25 @@ def main() -> None:
     command = [
         sys.executable, "-m", "PyInstaller",
         "--noconfirm", "--onefile", "--windowed", "--clean",
-        "--name", "ClaudeContextWidget",
+        "--name", "ClaudeWidget",
         "--icon", str(ICON),
         "--add-data", f"{ICON};.",
+        # Bundle the UI Automation wrapper comtypes generated on this machine.
+        # Without it the exe generates one at runtime, and that path imports
+        # importlib.metadata -> email, which EXCLUDES drops: every read fails
+        # and the widget says 클로드 앱을 못 찾음.
+        "--hidden-import", "comtypes.gen.UIAutomationClient",
         "--distpath", str(DIST),
         "--workpath", str(WORK),
         "--specpath", str(WORK),
     ]
     for module in EXCLUDES:
         command += ["--exclude-module", module]
-    command.append(str(HERE / "ctx_widget.py"))
+    command.append(str(HERE / "claude_widget.py"))
     subprocess.run(command, check=True)
 
     shutil.rmtree(WORK, ignore_errors=True)
-    exe = DIST / "ClaudeContextWidget.exe"
+    exe = DIST / "ClaudeWidget.exe"
     print(f"{exe} ({exe.stat().st_size / 1024 / 1024:.1f} MB)")
 
 
