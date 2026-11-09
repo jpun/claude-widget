@@ -60,16 +60,21 @@ ERROR_LOG = app_dir() / "claude_widget.error.log"
 REFRESH_MS = 2000
 TRAY_POLL_MS = 120
 
+# Malgun Gothic carries Hangul itself; Segoe UI did not, so Windows drew the
+# Korean in a substitute font that clashed with the Latin at small sizes. The
+# English family name resolves on every Windows locale.
+BODY_FONT = "Malgun Gothic"
+
 SIZES = {
-    "작게": {"main": 10, "sub": 7, "bar": 170, "bar_height": 4, "pad": 7},
-    "보통": {"main": 12, "sub": 8, "bar": 210, "bar_height": 5, "pad": 10},
-    "크게": {"main": 15, "sub": 10, "bar": 265, "bar_height": 7, "pad": 13},
+    "작게": {"main": 10, "sub": 8, "bar": 170, "bar_height": 4, "pad": 7},
+    "보통": {"main": 12, "sub": 9, "bar": 210, "bar_height": 5, "pad": 10},
+    "크게": {"main": 15, "sub": 11, "bar": 265, "bar_height": 7, "pad": 13},
 }
 DEFAULT_SIZE = "보통"
 
 # Window width. Each size has its own default (the old fixed widths); the
 # user can drag the right edge, and that width is kept for every size.
-DEFAULT_WIDTHS = {"작게": 212, "보통": 256, "크게": 300}
+DEFAULT_WIDTHS = {"작게": 222, "보통": 270, "크게": 320}
 MIN_WIDTH, MAX_WIDTH = 180, 1400
 EDGE_PX = 6  # how close to the right edge a press starts a resize
 
@@ -1206,9 +1211,9 @@ class Widget:
     def fonts(self) -> dict[str, tuple]:
         spec = SIZES[self.size]
         return {"main": ("Consolas", spec["main"]),
-                "sub": ("Segoe UI", spec["sub"]),
-                "title": ("Segoe UI", spec["sub"], "bold"),
-                "small": ("Segoe UI", max(7, spec["sub"] - 1))}
+                "sub": (BODY_FONT, spec["sub"]),
+                "title": (BODY_FONT, spec["sub"], "bold"),
+                "small": (BODY_FONT, max(7, spec["sub"] - 1))}
 
     def window_width(self) -> int:
         return self.width or DEFAULT_WIDTHS[self.size]
@@ -1603,7 +1608,7 @@ class SettingsDialog:
 
         def caption(text: str, pady=(0, 2)) -> None:
             tk.Label(top, text=text, bg=colors["bg"], fg=colors["dim"],
-                     font=("Segoe UI", 9)).pack(anchor="w", pady=pady)
+                     font=(BODY_FONT, 9)).pack(anchor="w", pady=pady)
 
         def choice(parent, text, value, variable, command) -> None:
             tk.Radiobutton(parent, text=text, value=value, variable=variable,
@@ -1611,7 +1616,7 @@ class SettingsDialog:
                            activebackground=colors["bg"],
                            activeforeground=colors["fg"],
                            selectcolor=colors["field"], highlightthickness=0,
-                           bd=0, font=("Segoe UI", 9)).pack(side="left",
+                           bd=0, font=(BODY_FONT, 9)).pack(side="left",
                                                             padx=(0, 8))
 
         caption("테마")
@@ -1636,7 +1641,7 @@ class SettingsDialog:
             line = tk.Frame(top, bg=colors["bg"])
             line.pack(fill="x", pady=3)
             tk.Label(line, text="■", bg=colors["bg"], fg=colors[band],
-                     font=("Segoe UI", 11)).pack(side="left")
+                     font=(BODY_FONT, 11)).pack(side="left")
             entry = tk.Entry(line, width=5, justify="right",
                              bg=colors["field"], fg=colors["fg"],
                              insertbackground=colors["fg"], relief="flat",
@@ -1644,11 +1649,11 @@ class SettingsDialog:
             entry.insert(0, str(widget.thresholds[index]))
             entry.pack(side="left", padx=6)
             tk.Label(line, text=f"% {label}", bg=colors["bg"], fg=colors["fg"],
-                     font=("Segoe UI", 9)).pack(side="left")
+                     font=(BODY_FONT, 9)).pack(side="left")
             self.entries.append(entry)
 
         tk.Label(top, text="그 이상은 빨강", bg=colors["bg"], fg=colors["red"],
-                 font=("Segoe UI", 9)).pack(anchor="w", pady=(2, 10))
+                 font=(BODY_FONT, 9)).pack(anchor="w", pady=(2, 10))
 
         self.autostart = tk.BooleanVar(value=autostart_enabled())
         tk.Checkbutton(top, text="윈도우 시작 시 자동 실행",
@@ -1656,16 +1661,16 @@ class SettingsDialog:
                        fg=colors["fg"], activebackground=colors["bg"],
                        activeforeground=colors["fg"],
                        selectcolor=colors["field"], highlightthickness=0, bd=0,
-                       font=("Segoe UI", 9),
+                       font=(BODY_FONT, 9),
                        anchor="w").pack(fill="x", pady=(0, 10))
 
         buttons = tk.Frame(top, bg=colors["bg"])
         buttons.pack(fill="x")
         tk.Button(buttons, text="기본값", command=self.reset, relief="flat",
-                  bg=colors["field"], fg=colors["fg"], font=("Segoe UI", 9),
+                  bg=colors["field"], fg=colors["fg"], font=(BODY_FONT, 9),
                   padx=8).pack(side="left")
         tk.Button(buttons, text="적용", command=self.apply, relief="flat",
-                  bg=colors["field"], fg=colors["fg"], font=("Segoe UI", 9),
+                  bg=colors["field"], fg=colors["fg"], font=(BODY_FONT, 9),
                   padx=12).pack(side="right")
         top.bind("<Return>", lambda _event: self.apply())
         top.bind("<Escape>", lambda _event: top.destroy())
@@ -2004,7 +2009,7 @@ def self_check() -> None:
     widget.set_size("보통")
     widget.width = None
     assert widget.window_width() == DEFAULT_WIDTHS["보통"]
-    font = tkfont.Font(font=("Segoe UI", 8))
+    font = tkfont.Font(font=(BODY_FONT, 8))
     assert fit("짧음", font, 500) == "짧음"
     cut_text = fit("아주 긴 세션 제목 " * 10, font, 120)
     assert cut_text.endswith("…") and font.measure(cut_text) <= 120
