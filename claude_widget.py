@@ -59,6 +59,7 @@ ERROR_LOG = app_dir() / "claude_widget.error.log"
 
 REFRESH_MS = 2000
 TRAY_POLL_MS = 120
+READ_POLL_MS = 40  # how often the Tk side picks up the reader's results
 
 # Malgun Gothic carries Hangul itself; Segoe UI did not, so Windows drew the
 # Korean in a substitute font that clashed with the Latin at small sizes. The
@@ -220,7 +221,7 @@ UIA_IS_EXPAND_COLLAPSE_AVAILABLE = 30028
 UIA_EXPAND_STATE = 30070  # 0 collapsed, 1 expanded
 TREE_SCOPE_DESCENDANTS = 4
 
-_uia_client = None
+_uia_local = threading.local()
 
 # --- Win32 plumbing for the notification-area icon --------------------------
 
@@ -643,14 +644,16 @@ def set_click_through(hwnd: int, enabled: bool) -> None:
 
 
 def uia_client():
-    global _uia_client
-    if _uia_client is None:
+    """This thread's UI Automation client; COM objects stay on their thread."""
+    client = getattr(_uia_local, "client", None)
+    if client is None:
         import comtypes.client
 
         module = comtypes.client.GetModule("UIAutomationCore.dll")
-        _uia_client = comtypes.client.CreateObject(
+        client = comtypes.client.CreateObject(
             module.CUIAutomation, interface=module.IUIAutomation)
-    return _uia_client
+        _uia_local.client = client
+    return client
 
 
 def read_context_card(client, root) -> tuple[int, int] | None:
@@ -957,9 +960,16 @@ def fit(text: str, font: tkfont.Font, width: int) -> str:
         return ""
     if font.measure(text) <= width:
         return text
-    while text and font.measure(text + "…") > width:
-        text = text[:-1]
-    return text + "…" if text else ""
+    # The longest prefix that fits with its "…": a binary search, since each
+    # measure is a call into Tk and titles run to a hundred characters.
+    low, high = 0, len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if font.measure(text[:middle] + "…") <= width:
+            low = middle
+        else:
+            high = middle - 1
+    return text[:low] + "…" if low else ""
 
 
 def row_parts(row) -> list[tuple[str, str]]:
@@ -1423,8 +1433,119 @@ class Tray:
             self.hwnd = 0
 
 
+def detach_elements(rows: list[dict], groups: list[dict]) -> dict:
+    """Swap the UIA elements in a read for plain handles; handle -> element.
+
+    The elements stay on the reader thread that made them, so the Tk side
+    only ever holds strings. A title shared by two rows keeps the first,
+    the one the widget shows.
+    """
+    elements: dict[str, object] = {}
+    for kind, entries, name_key in (("row", rows, "title"),
+                                    ("group", groups, "name")):
+        for entry in entries:
+            element, entry["element"] = entry.get("element"), None
+            if element is None:
+                continue
+            handle = f"{kind}:{entry[name_key]}"
+            elements.setdefault(handle, element)
+            entry["element"] = handle
+    return elements
+
+
+class Reader:
+    """Reads and drives the app on a thread of its own.
+
+    A read takes 0.3-0.7 s of UI Automation calls, and unfolding the sidebar
+    waits for it to redraw; on the Tk thread either froze the window. Jobs
+    queue in, results queue out for the Tk side to drain. COM is initialised
+    on this thread and the UIA elements never leave it (see detach_elements).
+    """
+
+    def __init__(self) -> None:
+        self.jobs: queue.Queue = queue.Queue()
+        self.results: queue.Queue = queue.Queue()
+        self.elements: dict[str, object] = {}   # reader thread only
+        self.thread = threading.Thread(target=self.run, name="reader",
+                                       daemon=True)
+        self.thread.start()
+
+    # ---- Tk thread -----------------------------------------------------
+    def submit(self, job: str, **args) -> None:
+        self.jobs.put((job, args))
+
+    def drain(self) -> list[dict]:
+        found = []
+        while True:
+            try:
+                found.append(self.results.get_nowait())
+            except queue.Empty:
+                return found
+
+    def stop(self) -> None:
+        self.jobs.put(("stop", {}))
+        self.thread.join(timeout=2)
+
+    # ---- reader thread -------------------------------------------------
+    def run(self) -> None:
+        import comtypes
+
+        comtypes.CoInitialize()
+        try:
+            while True:
+                job, args = self.jobs.get()
+                if job == "stop":
+                    break
+                try:
+                    read = getattr(self, f"do_{job}")(**args)
+                except Exception:
+                    report_exception(*sys.exc_info())
+                    read = None
+                self.results.put({"job": job, "read": read})
+        finally:
+            self.elements.clear()
+            comtypes.CoUninitialize()
+
+    def read(self) -> dict:
+        active = read_active_session()
+        by_id, by_title = session_meta() if active else ({}, {})
+        if active:
+            _hwnd, (_context, _plan, rows, groups) = active
+            self.elements = detach_elements(rows, groups)
+        return {"active": active, "by_id": by_id, "by_title": by_title}
+
+    def do_read(self, auto_expand: bool = False) -> dict:
+        """One read; with *auto_expand*, unfold and read again when due."""
+        found = self.read()
+        if auto_expand and found["active"]:
+            hwnd, (_context, _plan, _rows, groups) = found["active"]
+            if auto_expand_due(True, groups,
+                               int(_user32.GetForegroundWindow() or 0), hwnd) \
+                    and expand_all(hwnd):
+                found = self.read()
+        return found
+
+    def do_unfold(self, hwnd: int) -> dict | None:
+        """Unfold the sidebar; a fresh read if anything opened."""
+        return self.read() if hwnd and expand_all(hwnd) else None
+
+    def do_open(self, hwnd: int, session: dict) -> None:
+        element = self.elements.get(session["element"] or "")
+        if session.get("group_header"):
+            # Unfold the group in the app and leave it open: the waiting
+            # session shows there, and on the next read here as itself.
+            if element is not None:
+                expand_collapse(element, True)
+            bring_forward(hwnd)
+        elif session["visible"]:
+            if element is not None:   # gone since the last read: nothing to do
+                open_session(hwnd, element)
+        elif session["sid"] and hwnd:
+            reveal_and_open(hwnd, session["title"], session["group"])
+
+
 class Widget:
-    def __init__(self, root: tk.Tk) -> None:
+    def __init__(self, root: tk.Tk, reader: Reader | None = None) -> None:
         self.root = root
         self.hidden = False
         self.tray: Tray | None = None
@@ -1504,6 +1625,10 @@ class Widget:
                                                      window=self.listbox)
         self.rows: list[tk.Widget] = []
         self.list_signature = None
+        # What the rows were built for; rows are reused while it holds.
+        self.list_layout = None
+        self.row_pools: dict[str, list] = {}   # tab -> its rows, kept
+        self.font_cache: dict[str, tkfont.Font] = {}
         # Dragging a 즐겨찾기 row: its index, and the line showing where it lands.
         self.drag_index: int | None = None
         self.dragging = False
@@ -1547,6 +1672,10 @@ class Widget:
         self.resizing = False
         self.moving = False
         self.press_width = 0
+        # Jobs handed to the reader and not answered yet; one of each at most.
+        self.pending: set[str] = set()
+        self.reader = reader or Reader()
+        self.poll_reader()
         self.refresh()
 
     def start_tray(self) -> None:
@@ -1630,6 +1759,12 @@ class Widget:
                 "title": (BODY_FONT, spec["sub"], "bold"),
                 "small": (BODY_FONT, max(7, spec["sub"] - 1))}
 
+    def font(self, name: str) -> tkfont.Font:
+        """A measuring font for fit(), made once per size."""
+        if name not in self.font_cache:
+            self.font_cache[name] = tkfont.Font(font=self.fonts()[name])
+        return self.font_cache[name]
+
     def window_width(self) -> int:
         return self.width or DEFAULT_WIDTHS[self.size]
 
@@ -1641,6 +1776,7 @@ class Widget:
     def apply_size(self) -> None:
         spec = SIZES[self.size]
         fonts = self.fonts()
+        self.font_cache = {}
         self.frame.configure(padx=spec["pad"], pady=max(4, spec["pad"] - 3))
         self.main.configure(font=fonts["main"])
         self.sub.configure(font=fonts["sub"])
@@ -1784,7 +1920,8 @@ class Widget:
         tab = getattr(widget, "tab", None)
         if tab:
             # Any tab click, the open one too, unfolds the sidebar and reads
-            # again: folded rows hide their status from the widget.
+            # again: folded rows hide their status from the widget. The tab
+            # shows at once; the unfolding happens on the reader.
             self.show_tab(tab)
             self.unfold_and_update()
             return
@@ -1891,12 +2028,16 @@ class Widget:
         width, height = self.window_width(), self.root.winfo_reqheight()
         x, y = clamp_to_area(int(match.group(1)), int(match.group(2)),
                              width, height, work_area(self.root.winfo_id()))
-        self.root.geometry(f"{width}x{height}+{x}+{y}")
+        wanted = f"{width}x{height}+{x}+{y}"
+        # place() runs on every list change; most leave the size as it was.
+        if self.root.winfo_geometry() != wanted:
+            self.root.geometry(wanted)
 
     def quit(self) -> None:
         self.persist()
         if self.tray:
             self.tray.close()
+        self.reader.stop()
         self.root.destroy()
 
     # ---- tabs and list ---------------------------------------------------
@@ -1911,8 +2052,23 @@ class Widget:
         return self.colors["border"]
 
     def unfold_and_update(self) -> None:
-        if self.app_hwnd and expand_all(self.app_hwnd):
-            self.update_now()
+        """Have the reader unfold the sidebar and, if it did, read again."""
+        if self.app_hwnd:
+            self.submit("unfold", hwnd=self.app_hwnd)
+
+    def submit(self, job: str, **args) -> None:
+        """Hand *job* to the reader unless the same job is still pending."""
+        if job in self.pending:
+            return
+        self.pending.add(job)
+        self.reader.submit(job, **args)
+
+    def poll_reader(self) -> None:
+        for result in self.reader.drain():
+            self.pending.discard(result["job"])
+            if result["read"] is not None:
+                self.apply_read(result["read"])
+        self.root.after(READ_POLL_MS, self.poll_reader)
 
     def show_tab(self, tab: str) -> None:
         if tab not in TAB_KEYS or tab == self.tab:
@@ -1943,11 +2099,18 @@ class Widget:
                 bg, fg, underline = palette["bg"], palette["fg"], palette["bg"]
                 if active:
                     underline = palette["fg"]
+            # Every read lands here; reconfiguring an unchanged tab redraws it.
+            look = (text, font, bg, fg, underline)
+            if getattr(label, "look", None) == look:
+                continue
+            label.look = look
             label.configure(text=text, font=font, bg=bg, fg=fg)
             cell.configure(bg=bg)
             line.configure(bg=underline)
         self.tabbar.configure(bg=colors["bg"])
-        self.frame.configure(highlightbackground=self.border_color())
+        border = self.border_color()
+        if self.frame.cget("highlightbackground") != border:
+            self.frame.configure(highlightbackground=border)
 
     def clock(self) -> float:
         """Now, in ms; the self-check swaps it for a fixed time."""
@@ -1959,7 +2122,12 @@ class Widget:
                          self.clock())
 
     def render_list(self) -> None:
-        """Rebuild the rows - only when what they show has changed."""
+        """Show the tab's rows - only when what they show has changed.
+
+        Rows are kept and their texts updated in place; a row is made anew
+        only when its look changes (status, colour, a band) or it is new.
+        Rebuilding every row made the list flash each time a minute ticked.
+        """
         items = self.current_items()
         self.by_key = {item[1]["key"]: item[1] for item in items
                        if item[0] == "session"}
@@ -1975,31 +2143,94 @@ class Widget:
             return
         self.list_signature = signature
         top = self.canvas.yview()[0]
-        for row in self.rows:
-            row.destroy()
-        self.rows = []
+        layout = (self.theme, self.size, self.window_width())
+        if layout != self.list_layout:
+            # Fonts, colours or widths changed: nothing can be kept.
+            for pool in self.row_pools.values():
+                for row in pool:
+                    row.destroy()
+            self.row_pools = {}
+            self.rows = []
+            self.list_layout = layout
+        # Each tab keeps its rows while another is shown, so going back to a
+        # tab redraws what changed instead of building every row again.
+        pool = self.row_pools.get(self.tab, [])
+        if self.rows is not pool:
+            for row in self.rows:
+                row.pack_forget()
+            self.rows = []
+        spare: dict = {}
+        for row in pool:
+            spare.setdefault(row.shape, row)
+        rows = []
         band = None   # the colour of the 즐겨찾기 divider above, if any
         for index, (kind, item) in enumerate(items):
-            if kind == "session":
-                if self.tab == "attention":
-                    self.rows.append(self.attention_row(item))
-                else:
-                    row = self.plain_row(item, band)
-                    if self.tab == "favorites":
-                        row.fav_index = index
-                    self.rows.append(row)
-            elif kind == "mark":
+            if kind == "mark":
                 band = DIVIDER_HEX.get(item.get("color"))
-                row = self.mark_row(item)
+            shape = self.row_shape(kind, item, band)
+            row = spare.pop(shape, None)
+            if row is None:
+                row = self.make_row(kind, item, band)
+                row.shape = shape
+            elif kind == "session":
+                self.fill_row(row, item)
+            elif kind == "mark":
+                row.mark = item
+            if self.tab == "favorites" and kind in ("session", "mark"):
                 row.fav_index = index
-                self.rows.append(row)
-            elif kind == "divider":
-                self.rows.append(self.divider_row(item))
-            else:
-                self.rows.append(self.empty_row(item))
+            rows.append(row)
+        for row in spare.values():
+            row.destroy()
+        if rows != self.rows:
+            # Repack only when the order or the set of rows changed.
+            for row in rows:
+                row.pack_forget()
+            for row in rows:
+                row.pack(**row.pack_options)
+        self.rows = self.row_pools[self.tab] = rows
         self.fit_list()
         self.canvas.yview_moveto(top)
         self.place()
+
+    def row_shape(self, kind: str, item, band: str | None) -> tuple:
+        """What a row looks like apart from its texts; equal shapes reuse."""
+        if kind == "session":
+            star = self.tab != "favorites" and self.is_favorite(item["sid"])
+            return (kind, item["key"], item["kind"], item["status"],
+                    item["gone"], bool(item["info"]), band, star)
+        if kind == "mark":
+            return (kind, item["id"], item["name"], item.get("color"))
+        return (kind, item)
+
+    def make_row(self, kind: str, item, band: str | None) -> tk.Widget:
+        if kind == "session":
+            row = self.attention_row(item) if self.tab == "attention" \
+                else self.plain_row(item, band)
+        elif kind == "mark":
+            row = self.mark_row(item)
+        elif kind == "divider":
+            row = self.divider_row(item)
+        else:
+            row = self.empty_row(item)
+        return row
+
+    def fill_row(self, row: tk.Frame, session: dict) -> None:
+        """Put *session*'s texts into a row made for the same shape."""
+        row.session = session
+        if self.tab == "attention":
+            room = self.text_width(inset=12 + row.close_width)
+            title = fit(f"● {session['title']}", self.font("title"), room)
+            info = fit(f"   {session['info']}", self.font("small"), room)
+        else:
+            star = "★ " if self.tab != "favorites" and \
+                self.is_favorite(session["sid"]) else ""
+            title = fit(star + session["title"], self.font("title"),
+                        self.text_width(inset=12 + row.status_width))
+            info = fit(session["info"], self.font("sub"),
+                       self.text_width(inset=12))
+        for label, text in ((row.title, title), (row.info, info)):
+            if label.cget("text") != text:
+                label.configure(text=text)
 
     def fit_list(self) -> None:
         """Size the canvas to the list, up to its share of the screen."""
@@ -2008,73 +2239,63 @@ class Widget:
         height = self.listbox.winfo_reqheight()
         left, top, right, bottom = work_area(self.root.winfo_id())
         cap = max(120, int((bottom - top) * LIST_MAX_SHARE))
+        wanted = (width, min(height, cap), height)
+        if wanted == getattr(self, "list_size", None):
+            return
+        self.list_size = wanted
         self.canvas.itemconfigure(self.list_window, width=width)
         self.canvas.configure(width=width, height=min(height, cap),
                               scrollregion=(0, 0, width, height))
 
     def attention_row(self, session: dict) -> tk.Frame:
         fonts = self.fonts()
-        title_font = tkfont.Font(font=fonts["title"])
-        small_font = tkfont.Font(font=fonts["small"])
-        close_width = title_font.measure("✕") + 12
-        room = self.text_width(inset=12 + close_width)
         row = tk.Frame(self.listbox, padx=6, pady=2, cursor="hand2")
         row.key = session["key"]
         row.kind = session["kind"]
+        row.close_width = self.font("title").measure("✕") + 12
         row.columnconfigure(0, weight=1)
-        row.title = tk.Label(row, text=fit(f"● {session['title']}", title_font,
-                                           room),
-                             anchor="w", width=1, cursor="hand2",
+        row.title = tk.Label(row, anchor="w", width=1, cursor="hand2",
                              font=fonts["title"])
         row.title.grid(row=0, column=0, sticky="we")
         row.close = tk.Label(row, text="✕", cursor="hand2", padx=4,
                              font=fonts["title"])
         row.close.grid(row=0, column=1, rowspan=2, sticky="ne")
-        row.info = tk.Label(row, text=fit(f"   {session['info']}", small_font,
-                                          room),
-                            anchor="w", width=1, cursor="hand2",
+        row.info = tk.Label(row, anchor="w", width=1, cursor="hand2",
                             font=fonts["small"])
         if session["info"]:
             row.info.grid(row=1, column=0, sticky="we")
-        row.pack(fill="x", pady=(2, 0))
+        row.pack_options = {"fill": "x", "pady": (2, 0)}
+        self.fill_row(row, session)
         self.paint_attention(row)
         self.bind_hover(row, self.paint_attention)
         return row
 
     def plain_row(self, session: dict, band: str | None = None) -> tk.Frame:
         fonts = self.fonts()
-        title_font = tkfont.Font(font=fonts["title"])
-        info_font = tkfont.Font(font=fonts["sub"])
         status = session["status"]
         if session["kind"]:
             status = f"● {status}"
-        status_width = title_font.measure(status) + 8 if status else 0
-        room = self.text_width(inset=12 + status_width)
         row = tk.Frame(self.listbox, pady=3, cursor="hand2")
         row.key = session["key"]
-        row.session = session
+        row.status_width = self.font("title").measure(status) + 8 \
+            if status else 0
         row.columnconfigure(1, weight=1)
         # A divider's colour shows as a thin band down the left edge.
         if band:
             tk.Frame(row, width=STRIPE_PX, bg=band).grid(
                 row=0, column=0, rowspan=2, sticky="ns")
-        star = "★ " if self.tab != "favorites" and \
-            self.is_favorite(session["sid"]) else ""
-        row.title = tk.Label(row, text=fit(star + session["title"], title_font,
-                                           room),
-                             anchor="w", width=1, cursor="hand2", padx=6,
+        row.title = tk.Label(row, anchor="w", width=1, cursor="hand2", padx=6,
                              font=fonts["title"])
         row.title.grid(row=0, column=1, sticky="we")
         row.status = tk.Label(row, text=status, cursor="hand2", padx=6,
                               font=fonts["title"])
         row.status.grid(row=0, column=2, sticky="e")
-        row.info = tk.Label(row, text=fit(session["info"], info_font,
-                                          self.text_width(inset=12)),
-                            anchor="w", width=1, cursor="hand2", padx=6,
+        row.info = tk.Label(row, anchor="w", width=1, cursor="hand2", padx=6,
                             font=fonts["sub"])
         if session["info"]:
             row.info.grid(row=1, column=1, columnspan=2, sticky="we")
-        row.pack(fill="x", pady=(2, 0))
+        row.pack_options = {"fill": "x", "pady": (2, 0)}
+        self.fill_row(row, session)
         self.paint_plain(row)
         self.bind_hover(row, self.paint_plain)
         return row
@@ -2087,7 +2308,7 @@ class Widget:
                  fg=colors["soft"]).grid(row=0, column=0, sticky="w")
         tk.Frame(row, height=1, bg=colors["track"]).grid(
             row=0, column=1, sticky="we", padx=(6, 0))
-        row.pack(fill="x", pady=(8, 1))
+        row.pack_options = {"fill": "x", "pady": (8, 1)}
         return row
 
     def mark_row(self, entry: dict) -> tk.Frame:
@@ -2099,21 +2320,21 @@ class Widget:
         row.mark = entry
         row.columnconfigure(1, weight=1)
         name = entry["name"] or "구분선"
-        tk.Label(row, text=fit(name, tkfont.Font(font=self.fonts()["title"]),
+        tk.Label(row, text=fit(name, self.font("title"),
                                self.text_width() // 2),
                  font=self.fonts()["title"], bg=colors["bg"],
                  fg=color or colors["soft"], cursor="fleur").grid(
             row=0, column=0, sticky="w")
         tk.Frame(row, height=2 if color else 1, bg=color or colors["track"],
                  cursor="fleur").grid(row=0, column=1, sticky="we", padx=(6, 0))
-        row.pack(fill="x", pady=(10, 2))
+        row.pack_options = {"fill": "x", "pady": (10, 2)}
         return row
 
     def empty_row(self, text: str) -> tk.Label:
         label = tk.Label(self.listbox, text=text, anchor="w", width=1,
                          font=self.fonts()["sub"], bg=self.colors["bg"],
                          fg=self.colors["dim"], pady=8)
-        label.pack(fill="x")
+        label.pack_options = {"fill": "x"}
         return label
 
     def paint_attention(self, row: tk.Frame, hover: bool = False) -> None:
@@ -2150,17 +2371,10 @@ class Widget:
 
     # ---- actions -----------------------------------------------------------
     def open(self, session: dict) -> None:
+        """Open the session in the app; the reader does the clicking."""
         if session["gone"]:
             return
-        if session.get("group_header"):
-            # Unfold the group in the app and leave it open: the waiting
-            # session shows there, and on the next read here as itself.
-            expand_collapse(session["element"], True)
-            bring_forward(self.app_hwnd)
-        elif session["visible"] and session["element"] is not None:
-            open_session(self.app_hwnd, session["element"])
-        elif session["sid"] and self.app_hwnd:
-            reveal_and_open(self.app_hwnd, session["title"], session["group"])
+        self.submit("open", hwnd=self.app_hwnd, session=dict(session))
 
     def is_favorite(self, sid: str | None) -> bool:
         return bool(sid) and any(entry["id"] == sid for entry in self.favorites)
@@ -2207,16 +2421,12 @@ class Widget:
 
     # ---- data ----------------------------------------------------------
     def refresh(self) -> None:
-        self.update_now()
-        if auto_expand_due(self.auto_expand, self.groups,
-                           int(_user32.GetForegroundWindow() or 0),
-                           self.app_hwnd):
-            self.unfold_and_update()
+        self.submit("read", auto_expand=self.auto_expand)
         self.root.after(REFRESH_MS, self.refresh)
 
-    def update_now(self) -> None:
-        """Read the app once and redraw."""
-        active = read_active_session()
+    def apply_read(self, read: dict) -> None:
+        """Show what the reader found, redrawing only what changed."""
+        active = read["active"]
         if active is None:
             self.tokens = None
             self.detail = "클로드 앱을 못 찾음"
@@ -2227,7 +2437,7 @@ class Widget:
             self.app_found = True
             self.app_hwnd, (context, plan, rows, groups) = active
             self.groups = groups
-            self.by_id, by_title = session_meta()
+            self.by_id, by_title = read["by_id"], read["by_title"]
             self.remember_groups(rows, by_title)
             self.sessions = build_sessions(rows, self.by_id, by_title,
                                            self.group_cache, time.time() * 1000,
@@ -2272,8 +2482,8 @@ class Widget:
 
     def render(self) -> None:
         height = SIZES[self.size]["bar_height"]
-        self.sub.configure(text=fit(self.detail, tkfont.Font(
-            font=self.fonts()["sub"]), self.text_width()))
+        self.sub.configure(text=fit(self.detail, self.font("sub"),
+                                    self.text_width()))
         percent = self.percent()
         if percent is None:
             # The figures now live in the session panel; with the panel shut
@@ -2761,9 +2971,28 @@ def self_check() -> None:
     assert keys(tab_items("favorites", sessions, [], set(), by_id, groups, now)) \
         == [("empty", "세션에서 오른쪽 버튼 → 즐겨찾기에 추가")]
 
+    class FakeReader:
+        """Takes jobs without running them: the check never reads the app."""
+        def __init__(self):
+            self.jobs = []
+            self.results = []
+
+        def submit(self, job, **args):
+            self.jobs.append((job, args))
+
+        def drain(self):
+            found, self.results = self.results, []
+            return found
+
+        def stop(self):
+            pass
+
     root = tk.Tk()
     root.withdraw()
-    widget = Widget(root)
+    reader = FakeReader()
+    widget = Widget(root, reader)
+    # The first read goes to the reader instead of holding up the window.
+    assert reader.jobs == [("read", {"auto_expand": widget.auto_expand})]
     assert root.bind("<Button-1>")
     assert root.bind("<B1-Motion>")
     # The toplevel carries the bindings, and the children must NOT repeat them
@@ -2812,20 +3041,44 @@ def self_check() -> None:
     assert widget.rows[0].cget("text") == "확인할 세션이 없음"
 
     # A tab click switches the list and is remembered; any tab click, the
-    # open one too, unfolds the sidebar and reads again when it unfolded
-    # something.
-    calls = []
-    saved_expand, saved_update = expand_all, widget.update_now
-    globals()["expand_all"] = lambda hwnd: calls.append("expand") or 2
-    widget.update_now = lambda: calls.append("update")
+    # open one too, asks the reader to unfold the sidebar. The click itself
+    # never waits for that, and a second click while it runs adds nothing.
+    reader.jobs.clear()
+    widget.pending.clear()   # the first read, which this reader never answers
     widget.app_hwnd = 1
     widget.on_click(widget.tab_parts["attention"][1])
-    assert widget.tab == "attention" and calls == ["expand", "update"]
-    globals()["expand_all"] = lambda hwnd: calls.append("expand") or 0
     widget.on_click(widget.tab_parts["attention"][1])
-    assert calls == ["expand", "update", "expand"]
-    globals()["expand_all"] = saved_expand
-    widget.update_now = saved_update
+    assert widget.tab == "attention"
+    assert reader.jobs == [("unfold", {"hwnd": 1})]
+    # Nothing unfolded: the job just ends. Unfolded: its read is shown.
+    reader.results.append({"job": "unfold", "read": None})
+    widget.poll_reader()
+    assert widget.pending == set()
+    widget.on_click(widget.tab_parts["attention"][1])
+    assert len(reader.jobs) == 2
+    shown = []
+    saved_apply = widget.apply_read
+    widget.apply_read = shown.append
+    reader.results.append({"job": "unfold", "read": {"active": None}})
+    widget.poll_reader()
+    assert shown == [{"active": None}] and widget.pending == set()
+    widget.apply_read = saved_apply
+    # The hover unfolds the same way, at most every HOVER_EXPAND_S.
+    reader.jobs.clear()
+    widget.auto_expand, widget.groups = True, [{"collapsed": True}]
+    widget.last_hover_expand = 0
+    widget.on_enter(None)
+    widget.on_enter(None)
+    assert reader.jobs == [("unfold", {"hwnd": 1})]
+    widget.pending.clear()
+    widget.groups = []
+    # Opening a session goes to the reader too, as plain data.
+    reader.jobs.clear()
+    widget.open(dict(sessions[0], element="row:가"))
+    assert reader.jobs[0][0] == "open"
+    assert reader.jobs[0][1]["session"]["element"] == "row:가"
+    widget.pending.clear()
+    reader.jobs.clear()
     widget.app_hwnd = 0
     widget.on_click(widget.tab_parts["recent"][1])
     assert widget.tab == "recent"
@@ -2835,6 +3088,61 @@ def self_check() -> None:
     assert json.loads(STATE_FILE.read_text(encoding="utf-8"))["tab"] == "recent"
     widget.on_click(widget.tab_parts["running"][2])  # the underline counts too
     assert widget.tab == "running"
+
+    # A read result: the sidebar's elements stay with the reader; the Tk side
+    # gets handles. A title seen twice keeps its first row.
+    first, second, header = object(), object(), object()
+    read_rows = [{"title": "가", "element": first},
+                 {"title": "가", "element": second},
+                 {"title": "나", "element": None}]
+    read_groups = [{"name": "⭕ 프로그램", "element": header},
+                   {"name": "중첩", "element": None}]
+    handles = detach_elements(read_rows, read_groups)
+    assert handles == {"row:가": first, "group:⭕ 프로그램": header}
+    assert [r["element"] for r in read_rows] == ["row:가", "row:가", None]
+    assert [g["element"] for g in read_groups] == ["group:⭕ 프로그램", None]
+
+    # A minute passing changes only the info line: the rows stay, their text
+    # changes. A new status makes that one row anew.
+    widget.show_tab("recent")
+    before = list(widget.rows)
+    widget.sessions = [dict(s, info=s["info"] + " 더") if s["key"] == "local_b"
+                       else s for s in sessions]
+    widget.render_list()
+    assert widget.rows == before
+    assert widget.rows[3].info.cget("text").endswith(" 더")
+    widget.sessions = [dict(s, status="실행 중") if s["key"] == "local_c"
+                       else s for s in sessions]
+    widget.render_list()
+    assert [r.key for r in widget.rows if hasattr(r, "key")] == ["local_b"]
+    assert widget.rows[1] is before[3]
+    widget.sessions = sessions
+    widget.render_list()
+    # Going to another tab and back reuses that tab's rows.
+    recent_rows = list(widget.rows)
+    widget.show_tab("running")
+    assert not any(r.winfo_manager() for r in recent_rows)
+    widget.show_tab("recent")
+    assert widget.rows == recent_rows
+    assert all(r.winfo_manager() == "pack" for r in recent_rows)
+
+    # The real reader: a job runs on its own thread, COM ready there, and
+    # the answer comes back through drain().
+    live = Reader()
+
+    def probe():   # a UIA client fails to come up on a thread without COM
+        return {"thread": threading.current_thread().name,
+                "client": uia_client() is not None}
+    live.do_probe = probe
+    live.submit("probe")
+    deadline = time.time() + 5
+    answers = []
+    while not answers and time.time() < deadline:
+        answers = live.drain()
+        time.sleep(0.01)
+    live.stop()
+    assert answers == [{"job": "probe", "read": {"thread": "reader", "client": True}}],         answers
+    assert not live.thread.is_alive()
 
     # Favorites by session id: added from any tab, kept in the state file,
     # marked ★ elsewhere; a session without a file cannot be added.
@@ -2954,6 +3262,16 @@ def self_check() -> None:
     cut_text = fit("아주 긴 세션 제목 " * 10, font, 120)
     assert cut_text.endswith("…") and font.measure(cut_text) <= 120
     assert fit("abc", font, 0) == ""
+
+    def fit_slow(text, width):   # the old one-character-at-a-time cut
+        if font.measure(text) <= width:
+            return text
+        while text and font.measure(text + "…") > width:
+            text = text[:-1]
+        return text + "…" if text else ""
+    for sample in ("아주 긴 세션 제목 " * 6, "BookPrintAPI A4 소프트커버 페이지"):
+        for width in (0, 5, 17, 40, 77, 120, 200, 400):
+            assert fit(sample, font, width) == fit_slow(sample, width), width
     widget.sessions = [dict(widget.sessions[0], title="아주 긴 세션 제목 " * 10)]
     widget.width = 500
     widget.relayout()
