@@ -66,11 +66,41 @@ READ_POLL_MS = 40  # how often the Tk side picks up the reader's results
 # English family name resolves on every Windows locale.
 BODY_FONT = "Malgun Gothic"
 
+# "hero" is the context percentage, the one figure read at a glance.
 SIZES = {
-    "작게": {"main": 10, "sub": 8, "bar": 170, "bar_height": 4, "pad": 7},
-    "보통": {"main": 12, "sub": 9, "bar": 210, "bar_height": 5, "pad": 10},
-    "크게": {"main": 15, "sub": 11, "bar": 265, "bar_height": 7, "pad": 13},
+    "작게": {"main": 10, "hero": 13, "sub": 8, "bar": 170, "bar_height": 4,
+           "pad": 7},
+    "보통": {"main": 12, "hero": 16, "sub": 9, "bar": 210, "bar_height": 5,
+           "pad": 10},
+    "크게": {"main": 15, "hero": 20, "sub": 11, "bar": 265, "bar_height": 7,
+           "pad": 13},
 }
+
+# Spacing steps, in pixels: every gap and inner padding is one of these.
+SPACE = {"xs": 2, "sm": 4, "md": 8, "lg": 12, "xl": 16}
+ROW_PAD = SPACE["md"]   # a list row's text inset, left and right
+
+# Motion: durations (ms) and curves by role. Only state changes move -
+# the widget sits beside the user's work and refreshes every two seconds.
+MOTION = {"fast": 120, "base": 200, "slow": 300}
+FRAME_MS = 16
+
+
+def ease_out(t: float) -> float:
+    """Decelerate: things arriving (a row appearing, the bar settling)."""
+    return 1 - (1 - t) ** 3
+
+
+def ease_in_out(t: float) -> float:
+    """Accelerate then decelerate: something moving within the window."""
+    return 4 * t ** 3 if t < 0.5 else 1 - (-2 * t + 2) ** 3 / 2
+
+
+def blend(start: str, end: str, t: float) -> str:
+    """The colour *t* of the way from *start* to *end* ("#rrggbb")."""
+    a = [int(start[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(end[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{round(x + (y - x) * t):02x}" for x, y in zip(a, b))
 DEFAULT_SIZE = "보통"
 
 # Window width. Each size has its own default (the old fixed widths); the
@@ -175,6 +205,8 @@ RESET_WORD_RE = re.compile(r"재설정|초기화")
 CARD_CONTEXT_RE = re.compile(
     r"\s*([\d.]+)\s*([kKmM])?\s*/\s*([\d.]+)\s*([kKmM])?\s*")
 CONTEXT_CARD_NAME = "컨텍스트"
+# The open session's page is a document named "<session title> - Claude Code".
+DOCUMENT_SUFFIX = " - Claude Code"
 
 # A sidebar row is a button followed by its "<title>에 대한 더 많은 옵션"
 # button, which gives the bare title. The row's status ("실행 중", "입력 대기
@@ -215,6 +247,7 @@ UIA_NAME_PROPERTY = 30005
 UIA_BUTTON_CONTROL_TYPE = 50000
 UIA_TEXT_CONTROL_TYPE = 50020
 UIA_GROUP_CONTROL_TYPE = 50026
+UIA_DOCUMENT_CONTROL_TYPE = 50030
 UIA_INVOKE_PATTERN = 10000
 UIA_EXPAND_COLLAPSE_PATTERN = 10005
 UIA_IS_EXPAND_COLLAPSE_AVAILABLE = 30028
@@ -1126,6 +1159,27 @@ def expand_all(hwnd: int) -> int:
     return opened
 
 
+def current_title(names: list[str]) -> str | None:
+    """The open session's title, out of the window's document names."""
+    for name in names:
+        if name.endswith(DOCUMENT_SUFFIX) and len(name) > len(DOCUMENT_SUFFIX):
+            return name[:-len(DOCUMENT_SUFFIX)]
+    return None
+
+
+def document_names(hwnd: int) -> list[str]:
+    """Names of the window's documents (the app shell, the open session…)."""
+    try:
+        client = uia_client()
+        found = client.ElementFromHandle(hwnd).FindAll(
+            TREE_SCOPE_DESCENDANTS, client.CreatePropertyCondition(
+                UIA_CONTROL_TYPE_PROPERTY, UIA_DOCUMENT_CONTROL_TYPE))
+        return [found.GetElement(i).CurrentName or ""
+                for i in range(found.Length)]
+    except Exception:  # COM is allowed to fail; the menu then says so
+        return []
+
+
 def read_active_session():
     """What the app is showing right now, or None if it cannot be read."""
     for hwnd in claude_windows():
@@ -1509,10 +1563,13 @@ class Reader:
     def read(self) -> dict:
         active = read_active_session()
         by_id, by_title = session_meta() if active else ({}, {})
+        current = None
         if active:
-            _hwnd, (_context, _plan, rows, groups) = active
+            hwnd, (_context, _plan, rows, groups) = active
             self.elements = detach_elements(rows, groups)
-        return {"active": active, "by_id": by_id, "by_title": by_title}
+            current = current_title(document_names(hwnd))
+        return {"active": active, "by_id": by_id, "by_title": by_title,
+                "current": current}
 
     def do_read(self, auto_expand: bool = False) -> dict:
         """One read; with *auto_expand*, unfold and read again when due."""
@@ -1590,39 +1647,59 @@ class Widget:
         # The window's width is set outright (place() gives it), never taken
         # from the text: a window that resizes as the numbers change slips out
         # from under the pointer mid-drag. Long text is cut to fit instead.
-        self.main = tk.Label(self.header, text="…", width=1, anchor="w")
-        self.main.pack(fill="x")
+        # The percentage large on the left, the token figures quiet beside it.
+        self.figures = tk.Frame(self.header)
+        self.figures.pack(fill="x")
+        self.figures.columnconfigure(1, weight=1)
+        self.main = tk.Label(self.figures, text="…", anchor="w", padx=0, pady=0)
+        self.main.grid(row=0, column=0, sticky="sw")
+        self.tokens_label = tk.Label(self.figures, anchor="e", width=1,
+                                     padx=0)
+        self.tokens_label.grid(row=0, column=1, sticky="sew",
+                               pady=(0, SPACE["xs"]))
         self.bar = tk.Canvas(self.header, highlightthickness=0, width=1)
         self.bar.pack(fill="x")
         self.bar_fill = self.bar.create_rectangle(0, 0, 0, 0, width=0)
+        self.bar_width = 0.0   # the fill's drawn width, while it glides
         self.sub = tk.Label(self.header, text="세션 찾는 중", width=1, anchor="w")
         self.sub.pack(fill="x")
 
         # Tabs: a label and a 2px underline each. Each takes its text's width
         # and an even share of what is left, so 확인 필요 3 fits next to 최근.
         self.tabbar = tk.Frame(self.frame)
-        self.tabbar.pack(fill="x", pady=(6, 0))
+        self.tabbar.pack(fill="x", pady=(SPACE["md"], 0))
         self.tab_parts: dict[str, tuple] = {}
         for column, (key, _label) in enumerate(TABS):
             cell = tk.Frame(self.tabbar, cursor="hand2")
             cell.grid(row=0, column=column, sticky="we")
             self.tabbar.columnconfigure(column, weight=1)
-            label = tk.Label(cell, cursor="hand2", pady=3, padx=2)
+            label = tk.Label(cell, cursor="hand2", pady=SPACE["sm"],
+                             padx=SPACE["xs"])
             label.pack(fill="x")
             line = tk.Frame(cell, height=2)
             line.pack(fill="x")
             for part in (cell, label, line):
                 part.tab = key
             self.tab_parts[key] = (cell, label, line)
+        # One underline for the open tab, gliding from tab to tab over the
+        # tabs' own 2px lines.
+        self.tab_indicator = tk.Frame(self.tabbar, height=2, cursor="hand2")
+        self.indicator_at: tuple[float, float] | None = None
 
         # The list scrolls inside a canvas once it is taller than its share
         # of the screen.
         self.canvas = tk.Canvas(self.frame, highlightthickness=0, bd=0,
                                 yscrollincrement=24, width=1, height=1)
-        self.canvas.pack(fill="x", pady=(4, 0))
-        self.listbox = tk.Frame(self.canvas)
-        self.list_window = self.canvas.create_window(0, 0, anchor="nw",
-                                                     window=self.listbox)
+        self.canvas.pack(fill="x", pady=(SPACE["sm"], 0))
+        # One list per tab, each in its own canvas window; switching tabs
+        # shows another window instead of repacking rows.
+        self.listboxes: dict[str, tk.Frame] = {}
+        self.list_windows: dict[str, int] = {}
+        for key in TAB_KEYS:
+            self.listboxes[key] = tk.Frame(self.canvas)
+            self.list_windows[key] = self.canvas.create_window(
+                0, 0, anchor="nw", window=self.listboxes[key], state="hidden")
+        self.shown_list: str | None = None
         self.rows: list[tk.Widget] = []
         self.list_signature = None
         # What the rows were built for; rows are reused while it holds.
@@ -1633,7 +1710,7 @@ class Widget:
         self.drag_index: int | None = None
         self.dragging = False
         self.drop_index = 0
-        self.drop_line = tk.Frame(self.listbox, height=2)
+        self.drop_line = tk.Frame(self.listboxes["favorites"], height=2)
 
         # What the last read found.
         self.tokens: int | None = None
@@ -1647,7 +1724,10 @@ class Widget:
         # (session key, kind) of the rows the user closed with ✕.
         self.dismissed: set[tuple[str, str]] = set()
         self.groups: list[dict] = []
+        # The session open in the app: {"sid", "title"}, or None.
+        self.current: dict | None = None
         self.last_hover_expand = 0.0
+        self.animations: dict = {}   # key -> the running animation's token
         self.apply_size()
         self.apply_theme()
 
@@ -1726,6 +1806,15 @@ class Widget:
 
     # ---- window chrome -------------------------------------------------
     @property
+    def listbox(self) -> tk.Frame:
+        """The open tab's list."""
+        return self.listboxes[self.tab]
+
+    @property
+    def list_window(self) -> int:
+        return self.list_windows[self.tab]
+
+    @property
     def colors(self) -> dict[str, str]:
         return THEMES[self.theme]
 
@@ -1734,9 +1823,11 @@ class Widget:
         self.root.configure(bg=colors["bg"])
         self.frame.configure(bg=colors["bg"],
                              highlightbackground=self.border_color())
-        for part in (self.header, self.tabbar, self.canvas, self.listbox):
+        for part in (self.header, self.figures, self.tabbar, self.canvas,
+                     *self.listboxes.values()):
             part.configure(bg=colors["bg"])
         self.main.configure(bg=colors["bg"], fg=colors["fg"])
+        self.tokens_label.configure(bg=colors["bg"], fg=colors["dim"])
         self.sub.configure(bg=colors["bg"], fg=colors["fg"])
         self.bar.configure(bg=colors["track"])
         self.render_tabs()
@@ -1755,6 +1846,8 @@ class Widget:
     def fonts(self) -> dict[str, tuple]:
         spec = SIZES[self.size]
         return {"main": ("Consolas", spec["main"]),
+                "hero": ("Consolas", spec["hero"], "bold"),
+                "figure": ("Consolas", spec["sub"]),
                 "sub": (BODY_FONT, spec["sub"]),
                 "title": (BODY_FONT, spec["sub"], "bold"),
                 "small": (BODY_FONT, max(7, spec["sub"] - 1))}
@@ -1778,9 +1871,11 @@ class Widget:
         fonts = self.fonts()
         self.font_cache = {}
         self.frame.configure(padx=spec["pad"], pady=max(4, spec["pad"] - 3))
-        self.main.configure(font=fonts["main"])
+        self.main.configure(font=fonts["hero"])
+        self.tokens_label.configure(font=fonts["figure"])
         self.sub.configure(font=fonts["sub"])
         self.bar.configure(height=spec["bar_height"])
+        self.bar_width = -1.0   # redraw at the new height
         self.bar.pack_configure(pady=(spec["pad"] // 2, spec["pad"] // 2 + 1))
         self.relayout()
 
@@ -1791,9 +1886,26 @@ class Widget:
         self.render_list()
         self.render()
         self.place()
+        self.root.after_idle(self.move_indicator, False)
 
-    def build_menu(self) -> None:
+    def build_menu(self, current: bool = False) -> None:
+        """The widget menu; with *current*, the open session's favourite
+        item on top (the header's menu, not the tray's)."""
         self.menu.delete(0, "end")
+        if current:
+            session = self.current
+            if session is None:
+                self.menu.add_command(label="현재 세션을 찾을 수 없음",
+                                      state="disabled")
+            elif self.is_favorite(session["sid"]):
+                self.menu.add_command(
+                    label=f"즐겨찾기에서 빼기 — {session['title']}",
+                    command=lambda: self.toggle_favorite(session))
+            else:
+                self.menu.add_command(
+                    label=f"★ 즐겨찾기에 추가 — {session['title']}",
+                    command=lambda: self.toggle_favorite(session))
+            self.menu.add_separator()
         if self.tray:
             self.menu.add_command(label="표시" if self.hidden else "숨기기",
                                   command=self.toggle_visible)
@@ -1826,7 +1938,8 @@ class Widget:
 
     # ---- pointer -------------------------------------------------------
     def in_header(self, widget) -> bool:
-        return widget in (self.header, self.main, self.bar, self.sub)
+        return widget in (self.header, self.figures, self.main,
+                          self.tokens_label, self.bar, self.sub)
 
     def near_right_edge(self, x_root: int) -> bool:
         right = self.root.winfo_rootx() + self.root.winfo_width()
@@ -1947,7 +2060,7 @@ class Widget:
 
     def on_right_click(self, event: tk.Event) -> None:
         if self.in_header(event.widget):
-            self.build_menu()
+            self.build_menu(current=True)
             self.popup_menu(event.x_root, event.y_root)
             return
         if not self.in_list(event.widget):
@@ -2040,6 +2153,56 @@ class Widget:
         self.reader.stop()
         self.root.destroy()
 
+    # ---- motion ----------------------------------------------------------
+    def animate(self, key, duration: int, ease, step) -> None:
+        """Call step(eased 0..1) every frame for *duration* ms.
+
+        A new animation under the same key takes over from the old one. With
+        the window hidden or not yet shown it jumps to the end. A step whose
+        widget has gone ends the animation.
+        """
+        token = object()
+        self.animations[key] = token
+        if self.hidden or not self.root.winfo_viewable():
+            self.animations.pop(key)
+            step(1.0)
+            return
+        start = time.perf_counter()
+
+        def frame() -> None:
+            if self.animations.get(key) is not token:
+                return
+            t = min(1.0, (time.perf_counter() - start) * 1000 / duration)
+            try:
+                step(ease(t))
+            except tk.TclError:
+                t = 1.0
+            if t < 1.0:
+                self.root.after(FRAME_MS, frame)
+            elif self.animations.get(key) is token:
+                del self.animations[key]
+
+        frame()
+
+    def move_indicator(self, glide: bool = True) -> None:
+        """Put the underline under the open tab, gliding there if *glide*."""
+        cell = self.tab_parts[self.tab][0]
+        x, width = cell.winfo_x(), cell.winfo_width()
+        if width <= 1:   # not laid out yet
+            self.root.after(50, self.move_indicator, False)
+            return
+        self.tab_indicator.tab = self.tab
+        self.tab_indicator.lift()
+        start = self.indicator_at if glide and self.indicator_at else (x, width)
+
+        def step(t: float) -> None:
+            at = (start[0] + (x - start[0]) * t,
+                  start[1] + (width - start[1]) * t)
+            self.indicator_at = at
+            self.tab_indicator.place(x=round(at[0]), rely=1.0, y=-2,
+                                     width=round(at[1]), height=2)
+        self.animate("indicator", MOTION["base"], ease_in_out, step)
+
     # ---- tabs and list ---------------------------------------------------
     def attention(self) -> list[dict]:
         return attention_of(self.sessions, self.dismissed)
@@ -2076,6 +2239,7 @@ class Widget:
         self.tab = tab
         self.canvas.yview_moveto(0)
         self.render_tabs()
+        self.move_indicator()
         self.render_list()
         self.persist()
 
@@ -2099,6 +2263,10 @@ class Widget:
                 bg, fg, underline = palette["bg"], palette["fg"], palette["bg"]
                 if active:
                     underline = palette["fg"]
+            if active:
+                # The gliding indicator draws the open tab's underline.
+                self.tab_indicator.configure(bg=underline)
+                underline = bg
             # Every read lands here; reconfiguring an unchanged tab redraws it.
             look = (text, font, bg, fg, underline)
             if getattr(label, "look", None) == look:
@@ -2152,13 +2320,16 @@ class Widget:
             self.row_pools = {}
             self.rows = []
             self.list_layout = layout
-        # Each tab keeps its rows while another is shown, so going back to a
-        # tab redraws what changed instead of building every row again.
+        # Each tab keeps its rows in its own list while another is shown, so
+        # going back to a tab redraws what changed instead of every row.
         pool = self.row_pools.get(self.tab, [])
-        if self.rows is not pool:
-            for row in self.rows:
-                row.pack_forget()
-            self.rows = []
+        if self.shown_list != self.tab:
+            if self.shown_list:
+                self.canvas.itemconfigure(self.list_windows[self.shown_list],
+                                          state="hidden")
+            self.canvas.itemconfigure(self.list_window, state="normal")
+            self.shown_list = self.tab
+        self.rows = pool
         spare: dict = {}
         for row in pool:
             spare.setdefault(row.shape, row)
@@ -2172,6 +2343,10 @@ class Widget:
             if row is None:
                 row = self.make_row(kind, item, band)
                 row.shape = shape
+                if pool and self.tab == "attention" and kind == "session":
+                    self.fade_row(row, self.paint_attention,
+                                  start=self.colors["bg"],
+                                  duration=MOTION["slow"])
             elif kind == "session":
                 self.fill_row(row, item)
             elif kind == "mark":
@@ -2217,17 +2392,21 @@ class Widget:
     def fill_row(self, row: tk.Frame, session: dict) -> None:
         """Put *session*'s texts into a row made for the same shape."""
         row.session = session
+        star = self.tab != "favorites" and self.is_favorite(session["sid"])
+        texts = (session["title"], session["info"], star)
+        if getattr(row, "texts", None) == texts:
+            return   # fitting is the costly part: skip it when nothing changed
+        row.texts = texts
         if self.tab == "attention":
-            room = self.text_width(inset=12 + row.close_width)
+            room = self.text_width(inset=2 * ROW_PAD + row.close_width)
             title = fit(f"● {session['title']}", self.font("title"), room)
             info = fit(f"   {session['info']}", self.font("small"), room)
         else:
-            star = "★ " if self.tab != "favorites" and \
-                self.is_favorite(session["sid"]) else ""
-            title = fit(star + session["title"], self.font("title"),
-                        self.text_width(inset=12 + row.status_width))
+            title = fit(("★ " if star else "") + session["title"],
+                        self.font("title"),
+                        self.text_width(inset=2 * ROW_PAD + row.status_width))
             info = fit(session["info"], self.font("sub"),
-                       self.text_width(inset=12))
+                       self.text_width(inset=2 * ROW_PAD))
         for label, text in ((row.title, title), (row.info, info)):
             if label.cget("text") != text:
                 label.configure(text=text)
@@ -2239,7 +2418,7 @@ class Widget:
         height = self.listbox.winfo_reqheight()
         left, top, right, bottom = work_area(self.root.winfo_id())
         cap = max(120, int((bottom - top) * LIST_MAX_SHARE))
-        wanted = (width, min(height, cap), height)
+        wanted = (self.tab, width, min(height, cap), height)
         if wanted == getattr(self, "list_size", None):
             return
         self.list_size = wanted
@@ -2249,22 +2428,23 @@ class Widget:
 
     def attention_row(self, session: dict) -> tk.Frame:
         fonts = self.fonts()
-        row = tk.Frame(self.listbox, padx=6, pady=2, cursor="hand2")
+        row = tk.Frame(self.listbox, padx=ROW_PAD, pady=SPACE["sm"],
+                       cursor="hand2")
         row.key = session["key"]
         row.kind = session["kind"]
-        row.close_width = self.font("title").measure("✕") + 12
+        row.close_width = self.font("title").measure("✕") + 2 * SPACE["sm"]
         row.columnconfigure(0, weight=1)
         row.title = tk.Label(row, anchor="w", width=1, cursor="hand2",
                              font=fonts["title"])
         row.title.grid(row=0, column=0, sticky="we")
-        row.close = tk.Label(row, text="✕", cursor="hand2", padx=4,
+        row.close = tk.Label(row, text="✕", cursor="hand2", padx=SPACE["sm"],
                              font=fonts["title"])
         row.close.grid(row=0, column=1, rowspan=2, sticky="ne")
         row.info = tk.Label(row, anchor="w", width=1, cursor="hand2",
                             font=fonts["small"])
         if session["info"]:
             row.info.grid(row=1, column=0, sticky="we")
-        row.pack_options = {"fill": "x", "pady": (2, 0)}
+        row.pack_options = {"fill": "x", "pady": (SPACE["sm"], 0)}
         self.fill_row(row, session)
         self.paint_attention(row)
         self.bind_hover(row, self.paint_attention)
@@ -2275,26 +2455,26 @@ class Widget:
         status = session["status"]
         if session["kind"]:
             status = f"● {status}"
-        row = tk.Frame(self.listbox, pady=3, cursor="hand2")
+        row = tk.Frame(self.listbox, pady=SPACE["sm"], cursor="hand2")
         row.key = session["key"]
-        row.status_width = self.font("title").measure(status) + 8 \
+        row.status_width = self.font("title").measure(status) + ROW_PAD \
             if status else 0
         row.columnconfigure(1, weight=1)
         # A divider's colour shows as a thin band down the left edge.
         if band:
             tk.Frame(row, width=STRIPE_PX, bg=band).grid(
                 row=0, column=0, rowspan=2, sticky="ns")
-        row.title = tk.Label(row, anchor="w", width=1, cursor="hand2", padx=6,
-                             font=fonts["title"])
+        row.title = tk.Label(row, anchor="w", width=1, cursor="hand2",
+                             padx=ROW_PAD, font=fonts["title"])
         row.title.grid(row=0, column=1, sticky="we")
-        row.status = tk.Label(row, text=status, cursor="hand2", padx=6,
+        row.status = tk.Label(row, text=status, cursor="hand2", padx=ROW_PAD,
                               font=fonts["title"])
         row.status.grid(row=0, column=2, sticky="e")
-        row.info = tk.Label(row, anchor="w", width=1, cursor="hand2", padx=6,
-                            font=fonts["sub"])
+        row.info = tk.Label(row, anchor="w", width=1, cursor="hand2",
+                            padx=ROW_PAD, font=fonts["sub"])
         if session["info"]:
             row.info.grid(row=1, column=1, columnspan=2, sticky="we")
-        row.pack_options = {"fill": "x", "pady": (2, 0)}
+        row.pack_options = {"fill": "x", "pady": (SPACE["sm"], 0)}
         self.fill_row(row, session)
         self.paint_plain(row)
         self.bind_hover(row, self.paint_plain)
@@ -2307,8 +2487,8 @@ class Widget:
         tk.Label(row, text=text, font=self.fonts()["small"], bg=colors["bg"],
                  fg=colors["soft"]).grid(row=0, column=0, sticky="w")
         tk.Frame(row, height=1, bg=colors["track"]).grid(
-            row=0, column=1, sticky="we", padx=(6, 0))
-        row.pack_options = {"fill": "x", "pady": (8, 1)}
+            row=0, column=1, sticky="we", padx=(SPACE["md"], 0))
+        row.pack_options = {"fill": "x", "pady": (SPACE["md"], SPACE["xs"])}
         return row
 
     def mark_row(self, entry: dict) -> tk.Frame:
@@ -2326,29 +2506,32 @@ class Widget:
                  fg=color or colors["soft"], cursor="fleur").grid(
             row=0, column=0, sticky="w")
         tk.Frame(row, height=2 if color else 1, bg=color or colors["track"],
-                 cursor="fleur").grid(row=0, column=1, sticky="we", padx=(6, 0))
-        row.pack_options = {"fill": "x", "pady": (10, 2)}
+                 cursor="fleur").grid(row=0, column=1, sticky="we",
+                                      padx=(SPACE["md"], 0))
+        row.pack_options = {"fill": "x", "pady": (SPACE["lg"], SPACE["xs"])}
         return row
 
     def empty_row(self, text: str) -> tk.Label:
         label = tk.Label(self.listbox, text=text, anchor="w", width=1,
                          font=self.fonts()["sub"], bg=self.colors["bg"],
-                         fg=self.colors["dim"], pady=8)
+                         fg=self.colors["dim"], pady=SPACE["md"])
         label.pack_options = {"fill": "x"}
         return label
 
-    def paint_attention(self, row: tk.Frame, hover: bool = False) -> None:
+    def paint_attention(self, row: tk.Frame, hover: bool = False,
+                        bg: str | None = None) -> None:
         palette = KIND_COLORS[row.kind]
-        bg = palette["hover" if hover else "bg"]
+        bg = bg or palette["hover" if hover else "bg"]
         row.configure(bg=bg)
         for label in (row.title, row.close):
             label.configure(bg=bg, fg=palette["fg"])
         row.info.configure(bg=bg, fg=palette["dim"])
 
-    def paint_plain(self, row: tk.Frame, hover: bool = False) -> None:
+    def paint_plain(self, row: tk.Frame, hover: bool = False,
+                    bg: str | None = None) -> None:
         colors = self.colors
         session = row.session
-        bg = colors["track" if hover else "field"]
+        bg = bg or colors["track" if hover else "field"]
         row.configure(bg=bg)
         row.title.configure(bg=bg, fg=colors["dim" if session["gone"]
                                              else "fg"])
@@ -2364,10 +2547,24 @@ class Widget:
     def bind_hover(self, row: tk.Frame, paint) -> None:
         # Enter/Leave reach the toplevel's own handler (on_enter) as well,
         # which only looks at the time. Each part repaints the whole row:
-        # moving onto a label sends the frame a Leave first.
+        # moving onto a label sends the frame a Leave first, and the fade
+        # that starts then is taken over by the Enter right after it.
         for part in (row, *row.winfo_children()):
-            part.bind("<Enter>", lambda _e, r=row: paint(r, True))
-            part.bind("<Leave>", lambda _e, r=row: paint(r))
+            part.bind("<Enter>", lambda _e, r=row: self.fade_row(r, paint, True))
+            part.bind("<Leave>", lambda _e, r=row: self.fade_row(r, paint))
+
+    def fade_row(self, row: tk.Frame, paint, hover: bool = False,
+                 start: str | None = None, duration: int = MOTION["fast"]
+                 ) -> None:
+        """Ease a row's background from where it is (or *start*) to its
+        resting or hover colour."""
+        start = start or row.cget("bg")   # mid-fade, the colour it got to
+        paint(row, hover)
+        end = row.cget("bg")
+
+        def step(t: float) -> None:
+            paint(row, hover, blend(start, end, t))
+        self.animate(("row", str(row)), duration, ease_out, step)
 
     # ---- actions -----------------------------------------------------------
     def open(self, session: dict) -> None:
@@ -2433,11 +2630,17 @@ class Widget:
             self.sessions = []
             self.groups = []
             self.app_found = False
+            self.current = None
         else:
             self.app_found = True
             self.app_hwnd, (context, plan, rows, groups) = active
             self.groups = groups
             self.by_id, by_title = read["by_id"], read["by_title"]
+            # The session open in the app, by the same rule as the sidebar:
+            # of sessions sharing a title, the live, most recently active.
+            meta = by_title.get(read.get("current") or "")
+            self.current = {"sid": meta["sessionId"], "title": meta["title"]} \
+                if meta else None
             self.remember_groups(rows, by_title)
             self.sessions = build_sessions(rows, self.by_id, by_title,
                                            self.group_cache, time.time() * 1000,
@@ -2481,7 +2684,6 @@ class Widget:
         return f"{TRAY_TIP} {percent:.1f}%\n{self.detail}{waiting}"
 
     def render(self) -> None:
-        height = SIZES[self.size]["bar_height"]
         self.sub.configure(text=fit(self.detail, self.font("sub"),
                                     self.text_width()))
         percent = self.percent()
@@ -2489,23 +2691,67 @@ class Widget:
             # The figures now live in the session panel; with the panel shut
             # there is nothing to read, so say where they would come from.
             text = "알 수 없음 · 세션 패널" if self.app_found else "알 수 없음"
-            self.main.configure(text=text, fg=self.colors["dim"])
-            self.bar.coords(self.bar_fill, 0, 0, 0, height)
+            self.set_label(self.main, text=text, fg=self.colors["dim"],
+                           font=self.fonts()["title"])
+            self.set_label(self.tokens_label, text="")
+            self.glide_bar(0)
             return
 
         color = self.colors[band_for(percent, self.thresholds)]
-        self.main.configure(
-            text=f"{percent:4.1f}%   "
-                 f"{format_tokens(self.tokens)} / {format_tokens(self.max_now)}",
-            fg=color,
-        )
+        self.set_label(self.main, text=f"{percent:.1f}%", fg=color,
+                       font=self.fonts()["hero"])
+        self.set_label(self.tokens_label, text=fit(
+            f"{format_tokens(self.tokens)} / {format_tokens(self.max_now)}",
+            self.font("figure"), self.text_width() // 2))
         # Before the window is mapped winfo_width() is 1, not 0, so the bar
         # would be drawn one pixel wide on the very first paint.
         width = self.bar.winfo_width()
         if width <= 1:
             width = self.text_width()
-        self.bar.coords(self.bar_fill, 0, 0, round(width * percent / 100), height)
         self.bar.itemconfigure(self.bar_fill, fill=color)
+        self.glide_bar(width * percent / 100)
+
+    @staticmethod
+    def set_label(label: tk.Label, **options) -> None:
+        """Configure only what differs from the last call: every read lands
+        here, and reconfiguring a label redraws it."""
+        last = label.__dict__.setdefault("last_options", {})
+        changed = {key: value for key, value in options.items()
+                   if last.get(key) != value}
+        if changed:
+            last.update(changed)
+            label.configure(**changed)
+
+    def glide_bar(self, target: float) -> None:
+        """Ease the bar's fill to *target* pixels wide."""
+        if round(target) == round(self.bar_width) and \
+                "bar" not in self.animations:
+            return
+        height = SIZES[self.size]["bar_height"]
+        start = self.bar_width
+
+        def step(t: float) -> None:
+            self.bar_width = start + (target - start) * t
+            self.bar.coords(self.bar_fill, 0, 0, round(self.bar_width), height)
+        self.animate("bar", MOTION["slow"], ease_out, step)
+
+
+def dialog_button(parent, text: str, command, colors: dict,
+                  primary: bool = False) -> tk.Button:
+    """A flat button with hover and pressed states; *primary* is the one
+    action the dialog is for, in the app's accent colour."""
+    if primary:
+        accent = KIND_COLORS["ready"]
+        rest, hover, fg = accent["bg"], accent["hover"], accent["fg"]
+    else:
+        rest, hover, fg = colors["field"], colors["track"], colors["fg"]
+    button = tk.Button(parent, text=text, command=command, relief="flat",
+                       bd=0, bg=rest, fg=fg, activebackground=hover,
+                       activeforeground=fg, cursor="hand2",
+                       font=(BODY_FONT, 9), padx=SPACE["lg"], pady=SPACE["xs"])
+    button.bind("<Enter>", lambda _e: button.configure(bg=hover))
+    button.bind("<Leave>", lambda _e: button.configure(bg=rest))
+    return button
 
 
 class DividerDialog:
@@ -2518,7 +2764,7 @@ class DividerDialog:
         top = tk.Toplevel(widget.root)
         self.top = top
         top.title("구분선 편집" if entry else "구분선 추가")
-        top.configure(bg=colors["bg"], padx=14, pady=12)
+        top.configure(bg=colors["bg"], padx=SPACE["xl"], pady=SPACE["lg"])
         top.attributes("-topmost", True)
         top.resizable(False, False)
         top.minsize(260, 0)  # room for the title bar's own text
@@ -2529,32 +2775,30 @@ class DividerDialog:
                              insertbackground=colors["fg"], relief="flat",
                              font=(BODY_FONT, 10))
         self.name.insert(0, entry["name"] if entry else "")
-        self.name.pack(fill="x", pady=(2, 10), ipady=3)
+        self.name.pack(fill="x", pady=(SPACE["xs"], SPACE["lg"]),
+                       ipady=SPACE["sm"])
 
         tk.Label(top, text="색", bg=colors["bg"], fg=colors["dim"],
                  font=(BODY_FONT, 9)).pack(anchor="w")
         self.color = entry.get("color") if entry else None
         swatches = tk.Frame(top, bg=colors["bg"])
-        swatches.pack(fill="x", pady=(2, 12))
+        swatches.pack(fill="x", pady=(SPACE["xs"], SPACE["lg"]))
         self.swatches: dict = {}
         for key, label, hex_ in ((None, "없음", colors["track"]),
                                  *DIVIDER_COLORS):
             swatch = tk.Label(swatches, text="  ", bg=hex_, cursor="hand2",
                               width=2, relief="flat", bd=0,
                               highlightthickness=2)
-            swatch.pack(side="left", padx=(0, 4))
+            swatch.pack(side="left", padx=(0, SPACE["sm"]))
             swatch.bind("<Button-1>", lambda _e, k=key: self.pick(k))
             self.swatches[key] = swatch
         self.pick(self.color)
 
         buttons = tk.Frame(top, bg=colors["bg"])
         buttons.pack(fill="x")
-        tk.Button(buttons, text="취소", command=top.destroy, relief="flat",
-                  bg=colors["field"], fg=colors["fg"], font=(BODY_FONT, 9),
-                  padx=8).pack(side="left")
-        tk.Button(buttons, text="확인", command=self.save, relief="flat",
-                  bg=colors["field"], fg=colors["fg"], font=(BODY_FONT, 9),
-                  padx=12).pack(side="right")
+        dialog_button(buttons, "취소", top.destroy, colors).pack(side="left")
+        dialog_button(buttons, "확인", self.save, colors,
+                      primary=True).pack(side="right")
         top.bind("<Return>", lambda _event: self.save())
         top.bind("<Escape>", lambda _event: top.destroy())
         self.name.focus_set()
@@ -2587,7 +2831,7 @@ class SettingsDialog:
         top = tk.Toplevel(widget.root)
         self.top = top
         top.title("설정")
-        top.configure(bg=colors["bg"], padx=14, pady=12)
+        top.configure(bg=colors["bg"], padx=SPACE["xl"], pady=SPACE["lg"])
         top.attributes("-topmost", True)
         top.resizable(False, False)
 
@@ -2602,19 +2846,19 @@ class SettingsDialog:
                            activeforeground=colors["fg"],
                            selectcolor=colors["field"], highlightthickness=0,
                            bd=0, font=(BODY_FONT, 9)).pack(side="left",
-                                                            padx=(0, 8))
+                                                            padx=(0, SPACE["md"]))
 
         caption("테마")
         self.theme = tk.StringVar(value=widget.theme)
         themes = tk.Frame(top, bg=colors["bg"])
-        themes.pack(fill="x", pady=(2, 10))
+        themes.pack(fill="x", pady=(SPACE["xs"], SPACE["lg"]))
         for name in THEMES:
             choice(themes, name, name, self.theme, self.apply_theme)
 
         caption("크기")
         self.size = tk.StringVar(value=widget.size)
         sizes = tk.Frame(top, bg=colors["bg"])
-        sizes.pack(fill="x", pady=(2, 10))
+        sizes.pack(fill="x", pady=(SPACE["xs"], SPACE["lg"]))
         for name in SIZES:
             choice(sizes, name, name, self.size, self.apply_size)
 
@@ -2624,7 +2868,7 @@ class SettingsDialog:
         self.entries: list[tk.Entry] = []
         for index, (label, band) in enumerate(rows):
             line = tk.Frame(top, bg=colors["bg"])
-            line.pack(fill="x", pady=3)
+            line.pack(fill="x", pady=SPACE["sm"])
             tk.Label(line, text="■", bg=colors["bg"], fg=colors[band],
                      font=(BODY_FONT, 11)).pack(side="left")
             entry = tk.Entry(line, width=5, justify="right",
@@ -2632,13 +2876,13 @@ class SettingsDialog:
                              insertbackground=colors["fg"], relief="flat",
                              font=("Consolas", 11))
             entry.insert(0, str(widget.thresholds[index]))
-            entry.pack(side="left", padx=6)
+            entry.pack(side="left", padx=SPACE["md"])
             tk.Label(line, text=f"% {label}", bg=colors["bg"], fg=colors["fg"],
                      font=(BODY_FONT, 9)).pack(side="left")
             self.entries.append(entry)
 
         tk.Label(top, text="그 이상은 빨강", bg=colors["bg"], fg=colors["red"],
-                 font=(BODY_FONT, 9)).pack(anchor="w", pady=(2, 10))
+                 font=(BODY_FONT, 9)).pack(anchor="w", pady=(SPACE["xs"], SPACE["lg"]))
 
         self.autostart = tk.BooleanVar(value=autostart_enabled())
         self.auto_expand = tk.BooleanVar(value=widget.auto_expand)
@@ -2649,20 +2893,17 @@ class SettingsDialog:
                            activeforeground=colors["fg"],
                            selectcolor=colors["field"], highlightthickness=0,
                            bd=0, font=(BODY_FONT, 9),
-                           anchor="w").pack(fill="x", pady=(0, 6))
+                           anchor="w").pack(fill="x", pady=(0, SPACE["sm"]))
         tk.Label(top, text="앱이 앞 창이 아닐 때와 위젯에 마우스를 올릴 때 펼친다.\n"
                            "탭을 누르면 이 설정과 관계없이 펼친다.",
                  bg=colors["bg"], fg=colors["dim"], justify="left",
-                 font=(BODY_FONT, 8)).pack(anchor="w", pady=(0, 10))
+                 font=(BODY_FONT, 8)).pack(anchor="w", pady=(0, SPACE["lg"]))
 
         buttons = tk.Frame(top, bg=colors["bg"])
         buttons.pack(fill="x")
-        tk.Button(buttons, text="기본값", command=self.reset, relief="flat",
-                  bg=colors["field"], fg=colors["fg"], font=(BODY_FONT, 9),
-                  padx=8).pack(side="left")
-        tk.Button(buttons, text="적용", command=self.apply, relief="flat",
-                  bg=colors["field"], fg=colors["fg"], font=(BODY_FONT, 9),
-                  padx=12).pack(side="right")
+        dialog_button(buttons, "기본값", self.reset, colors).pack(side="left")
+        dialog_button(buttons, "적용", self.apply, colors,
+                      primary=True).pack(side="right")
         top.bind("<Return>", lambda _event: self.apply())
         top.bind("<Escape>", lambda _event: top.destroy())
         self.entries[0].focus_set()
@@ -3118,13 +3359,18 @@ def self_check() -> None:
     assert widget.rows[1] is before[3]
     widget.sessions = sessions
     widget.render_list()
-    # Going to another tab and back reuses that tab's rows.
+    # Going to another tab and back reuses that tab's rows: each tab has its
+    # own list, hidden while another tab is open.
     recent_rows = list(widget.rows)
     widget.show_tab("running")
-    assert not any(r.winfo_manager() for r in recent_rows)
+
+    def state_of(tab):
+        return widget.canvas.itemcget(widget.list_windows[tab], "state")
+    assert state_of("recent") == "hidden" and state_of("running") == "normal"
+    assert all(r.master is widget.listboxes["recent"] for r in recent_rows)
     widget.show_tab("recent")
     assert widget.rows == recent_rows
-    assert all(r.winfo_manager() == "pack" for r in recent_rows)
+    assert state_of("recent") == "normal" and state_of("running") == "hidden"
 
     # The real reader: a job runs on its own thread, COM ready there, and
     # the answer comes back through drain().
@@ -3143,6 +3389,43 @@ def self_check() -> None:
     live.stop()
     assert answers == [{"job": "probe", "read": {"thread": "reader", "client": True}}],         answers
     assert not live.thread.is_alive()
+
+    # The open session, from the window's documents: the app shell's page
+    # has no name, the session's says "<title> - Claude Code".
+    assert current_title(["", "API 기획 - Claude Code", ""]) == "API 기획"
+    assert current_title(["a - b - Claude Code"]) == "a - b"
+    assert current_title(["", "Claude"]) is None
+    assert current_title([" - Claude Code"]) is None
+    assert current_title([]) is None
+
+    # The header menu adds or removes that session; without one it says so.
+    def menu_labels():
+        return [widget.menu.entrycget(i, "label") if
+                widget.menu.type(i) == "command" else "-"
+                for i in range(widget.menu.index("end") + 1)]
+    widget.favorites = []
+    widget.apply_read({"active": (0, (None, None, [], [])), "by_id": by_id,
+                       "by_title": by_title, "current": "나"})
+    assert widget.current == {"sid": "local_b", "title": "나"}
+    widget.build_menu(current=True)
+    assert menu_labels()[:2] == ["★ 즐겨찾기에 추가 — 나", "-"]
+    widget.menu.invoke(0)
+    assert widget.favorites == [{"type": "session", "id": "local_b",
+                                 "title": "나"}]
+    widget.build_menu(current=True)
+    assert menu_labels()[0] == "즐겨찾기에서 빼기 — 나"
+    widget.menu.invoke(0)
+    assert widget.favorites == []
+    widget.apply_read({"active": (0, (None, None, [], [])), "by_id": by_id,
+                       "by_title": by_title, "current": "모르는 제목"})
+    widget.build_menu(current=True)
+    assert menu_labels()[0] == "현재 세션을 찾을 수 없음"
+    assert widget.menu.entrycget(0, "state") == "disabled"
+    widget.build_menu()   # the tray's menu has no such item
+    assert "현재 세션을 찾을 수 없음" not in menu_labels()
+    widget.sessions, widget.by_id = sessions, by_id
+    widget.group_cache = dict(groups)
+    widget.render_list()
 
     # Favorites by session id: added from any tab, kept in the state file,
     # marked ★ elsewhere; a session without a file cannot be added.
