@@ -159,13 +159,9 @@ DIVIDER_COLORS = (
     ("magenta", "분홍", "#d55181"))
 DIVIDER_HEX = {key: hex_ for key, _name, hex_ in DIVIDER_COLORS}
 
-# 확인 필요 sessions that just left the list stay below it a while, so a
+# 확인 필요 sessions that left the list stay below it for an hour, so a
 # mistaken click or a ✕ can be undone and a look put off can be had later.
-RECHECK_MS = 30 * 60 * 1000
-RECHECK_MAX = 5
-# A session that left within this long after the widget opened it counts as
-# looked at (확인함); otherwise it just dropped out (빠짐).
-OPENED_RECENT_S = 20
+RECHECK_MS = 60 * 60 * 1000
 STRIPE_PX = 3      # the colour band at the left of a session under a divider
 DRAG_START_PX = 5  # how far a press moves before it becomes a drag
 
@@ -954,22 +950,16 @@ def valid_favorite(entry) -> bool:
         and (entry.get("color") is None or entry.get("color") in DIVIDER_HEX)
 
 
-def departures(before: dict, now_keys: set, dismissed: set,
-               opened: dict, now_s: float) -> list[tuple[dict, str]]:
-    """Sessions that left 확인 필요 since the last read, with why.
+def departures(before: dict, now_keys: set, dismissed: set) -> list[dict]:
+    """Sessions that left 확인 필요 since the last read.
 
-    *before* maps key -> session as listed last time; *opened* maps key ->
-    when the widget opened it. A ✕ is noted when it happens, not here.
+    *before* maps key -> session as listed last time. A ✕ is noted when it
+    happens, not here; folded-group stand-ins are not sessions.
     """
-    left = []
-    for key, session in before.items():
-        if key in now_keys or (key, session["kind"]) in dismissed \
-                or key.startswith("group:"):
-            continue
-        label = "확인함" if now_s - opened.get(key, 0) < OPENED_RECENT_S \
-            else "빠짐"
-        left.append((session, label))
-    return left
+    return [session for key, session in before.items()
+            if key not in now_keys
+            and (key, session["kind"]) not in dismissed
+            and not key.startswith("group:")]
 
 
 def held_waiting(held: list[dict], active_keys: set) -> list[dict]:
@@ -994,21 +984,24 @@ def tab_items(tab: str, sessions: list[dict], favorites: list[dict],
                 base = hidden_session(entry["sid"], by_id.get(entry["sid"]),
                                       group_cache.get(entry["sid"]), now_ms,
                                       entry.get("title", ""))
-            return dict(base, origin=entry["key"], kind=None) if base else None
+            # A plain row (kind None), but the status keeps its colour: a
+            # ✕-hidden session may still be waiting.
+            return dict(base, origin=entry["key"], kind=None,
+                        status_kind=base["kind"]) if base else None
 
         # 보류: kept on the list by the user, whatever the app says.
         for entry in held_waiting(held, active_keys):
             session = copy_of(entry)
             if session:
                 session.update(key=f"held:{entry['key']}", status="보류",
-                               tone="soft", held=True)
+                               tone="soft", held=True, status_kind=None)
                 items.append(("session", session))
-        # 방금 확인함: what left in the last half hour, newest first.
+        # 방금 확인함: what left in the last hour, newest first.
         held_keys = {entry["key"] for entry in held}
         recent = [entry for entry in checked
                   if now_ms - entry["at"] < RECHECK_MS
                   and entry["key"] not in active_keys
-                  and entry["key"] not in held_keys][:RECHECK_MAX]
+                  and entry["key"] not in held_keys]
         if recent:
             items.append(("divider", "방금 확인함"))
         for entry in recent:
@@ -1017,8 +1010,9 @@ def tab_items(tab: str, sessions: list[dict], favorites: list[dict],
                 continue
             took = duration(now_ms - entry["at"])
             when = "방금" if took == "1분 미만" else f"{took} 전"
-            session.update(key=f"checked:{entry['key']}", status=entry["label"],
-                           tone="dim", checked=True,
+            # On the right, what the session is doing now (실행 중 and the
+            # like), as in 즐겨찾기; nothing when it is idle.
+            session.update(key=f"checked:{entry['key']}", checked=True,
                            info=f"{when} · {session['info']}"
                            if session["info"] else when)
             items.append(("session", session))
@@ -1700,10 +1694,8 @@ class Widget:
              "title": entry.get("title", "")}
             for entry in state.get("held") or []
             if isinstance(entry, dict) and isinstance(entry.get("key"), str)]
-        # 방금 확인함: what left 확인 필요 lately (this run only), and when the
-        # widget opened what.
+        # 방금 확인함: what left 확인 필요 lately (this run only).
         self.checked: list[dict] = []
-        self.opened: dict[str, float] = {}
         # session id -> the sidebar group it was last seen under.
         groups = state.get("groups")
         self.group_cache: dict[str, str] = {
@@ -2554,7 +2546,7 @@ class Widget:
     def plain_row(self, session: dict, band: str | None = None) -> tk.Frame:
         fonts = self.fonts()
         status = session["status"]
-        if session["kind"]:
+        if session["kind"] or session.get("status_kind"):
             status = f"● {status}"
         row = tk.Frame(self.listbox, pady=SPACE["sm"], cursor="hand2")
         row.key = session["key"]
@@ -2641,8 +2633,9 @@ class Widget:
         row.title.configure(bg=bg, fg=colors["dim" if session["gone"]
                                              else "fg"])
         # (the colour band, a plain Frame child, keeps its own colour)
-        if session["kind"]:
-            status_fg = KIND_COLORS[session["kind"]]["bg"]
+        if session["kind"] or session.get("status_kind"):
+            status_fg = KIND_COLORS[session["kind"]
+                                    or session["status_kind"]]["bg"]
         elif session.get("tone"):
             status_fg = colors[session["tone"]]
         else:
@@ -2679,7 +2672,6 @@ class Widget:
         """Open the session in the app; the reader does the clicking."""
         if session["gone"]:
             return
-        self.opened[session.get("origin", session["key"])] = time.time()
         self.submit("open", hwnd=self.app_hwnd, session=dict(session))
 
     def is_favorite(self, sid: str | None) -> bool:
@@ -2717,14 +2709,14 @@ class Widget:
         self.persist()
         self.render_list()
 
-    def note_checked(self, session: dict, label: str) -> None:
+    def note_checked(self, session: dict) -> None:
         """Put a session that left 확인 필요 under 방금 확인함."""
         key = session.get("origin", session["key"])
-        self.checked = [entry for entry in self.checked if entry["key"] != key]
+        now = self.clock()
+        self.checked = [entry for entry in self.checked
+                        if entry["key"] != key and now - entry["at"] < RECHECK_MS]
         self.checked.insert(0, {"key": key, "sid": session["sid"],
-                                "title": session["title"], "label": label,
-                                "at": self.clock()})
-        del self.checked[RECHECK_MAX * 4:]
+                                "title": session["title"], "at": now})
 
     def hold(self, session: dict) -> None:
         """Keep a session on 확인 필요 until released (나중에 다시 확인)."""
@@ -2751,7 +2743,7 @@ class Widget:
         """Hide one row until its session leaves that status and comes back."""
         session = self.by_key.get(key)
         if session:
-            self.note_checked(session, "숨김")
+            self.note_checked(session)
         self.dismissed.add((key, kind))
         self.render_tabs()
         self.render_list()
@@ -2790,9 +2782,8 @@ class Widget:
                                            groups)
             now_keys = {s["key"] for s in attention_of(self.sessions,
                                                        self.dismissed)}
-            for session, label in departures(before, now_keys, self.dismissed,
-                                             self.opened, time.time()):
-                self.note_checked(session, label)
+            for session in departures(before, now_keys, self.dismissed):
+                self.note_checked(session)
             # Back on the list by itself: no longer "just checked".
             self.checked = [entry for entry in self.checked
                             if entry["key"] not in now_keys]
@@ -3434,7 +3425,10 @@ def self_check() -> None:
     assert widget.rows[0].winfo_children()[0].cget("text") == "방금 확인함"
     checked_row = widget.rows[1]
     assert checked_row.key == "checked:local_a"
-    assert checked_row.status.cget("text") == "숨김"
+    # The right side says what the session does now: hidden with ✕, it still
+    # waits, in its colour.
+    assert checked_row.status.cget("text") == "● 입력 대기 중"
+    assert checked_row.status.cget("fg") == KIND_COLORS["awaiting"]["bg"]
     assert checked_row.info.cget("text").startswith("방금")
 
     # 나중에 다시 확인: held on the list, outlined, counted, not coloured.
@@ -3467,27 +3461,29 @@ def self_check() -> None:
     assert widget.checked == []
     assert widget.rows[0].cget("text") == "확인할 세션이 없음"
 
-    # Leaving the list: opened by the widget just now -> 확인함, otherwise
-    # 빠짐; a ✕ is not a departure; folded-group stand-ins are skipped.
+    # Leaving the list: a ✕ is not a departure (noted when pressed), nor a
+    # folded-group stand-in.
     before = {"a": {"key": "a", "kind": "ready"},
               "b": {"key": "b", "kind": "awaiting"},
               "c": {"key": "c", "kind": "awaiting"},
               "group:x": {"key": "group:x", "kind": "awaiting"}}
-    left = departures(before, {"c"}, {("b", "awaiting")}, {"a": 100.0}, 105.0)
-    assert [(s["key"], label) for s, label in left] == [("a", "확인함")]
-    left = departures(before, set(), set(), {"a": 10.0}, 105.0)
-    assert [(s["key"], label) for s, label in left] \
-        == [("a", "빠짐"), ("b", "빠짐"), ("c", "빠짐")]
+    assert [s["key"] for s in departures(before, {"c"}, {("b", "awaiting")})] \
+        == ["a"]
+    assert [s["key"] for s in departures(before, set(), set())] \
+        == ["a", "b", "c"]
     assert held_waiting([{"key": "a"}, {"key": "b"}], {"a"}) == [{"key": "b"}]
-    # 방금 확인함 keeps half an hour and five rows at most.
-    old = [{"key": f"k{n}", "sid": None, "title": f"t{n}", "label": "빠짐",
-            "at": now - n * 60_000} for n in range(8)]
-    live = [{"key": f"k{n}", "sid": None, "title": f"t{n}", "status": "",
-             "kind": None, "info": "", "element": None, "group": "",
-             "visible": True, "last": 0, "gone": False} for n in range(8)]
+    # 방금 확인함 keeps the last hour, however many; the right side shows the
+    # session's own status now.
+    old = [{"key": f"k{n}", "sid": None, "title": f"t{n}",
+            "at": now - n * 10 * 60_000} for n in range(8)]
+    live = [{"key": f"k{n}", "sid": None, "title": f"t{n}",
+             "status": "실행 중" if n == 1 else "", "kind": None, "info": "",
+             "element": None, "group": "", "visible": True, "last": 0,
+             "gone": False} for n in range(8)]
     items = tab_items("attention", live, [], set(), {}, {}, now, [], old)
-    assert [i[1]["key"] for i in items if i[0] == "session"] \
-        == [f"checked:k{n}" for n in range(RECHECK_MAX)]
+    shown = [i[1] for i in items if i[0] == "session"]
+    assert [s["key"] for s in shown] == [f"checked:k{n}" for n in range(6)]
+    assert [s["status"] for s in shown[:2]] == ["", "실행 중"]
     stale = [dict(old[0], at=now - RECHECK_MS - 1)]
     assert tab_items("attention", live, [], set(), {}, {}, now, [], stale) \
         == [("empty", "확인할 세션이 없음")]
