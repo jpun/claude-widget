@@ -2167,6 +2167,9 @@ class Widget:
             else:
                 menu.add_command(label="나중에 다시 확인",
                                  command=lambda: self.hold(session))
+            if session.get("checked"):
+                menu.add_command(label="방금 확인함에서 빼기",
+                                 command=lambda: self.forget_checked(origin))
             menu.add_separator()
         if session and not session.get("group_header"):
             if not session["sid"]:
@@ -2737,6 +2740,11 @@ class Widget:
         self.held = [entry for entry in self.held if entry["key"] != key]
         self.persist()
         self.render_tabs()
+        self.render_list()
+
+    def forget_checked(self, key: str) -> None:
+        """Take one row off 방금 확인함 before its half hour is up."""
+        self.checked = [entry for entry in self.checked if entry["key"] != key]
         self.render_list()
 
     def dismiss(self, key: str, kind: str) -> None:
@@ -3445,8 +3453,18 @@ def self_check() -> None:
     widget.release("local_a")
     assert widget.held == []
     assert widget.rows[1].key == "checked:local_a"
-    widget.checked = []
-    widget.relayout()
+    # Its right-click menu offers to take it off 방금 확인함, which does.
+    from types import SimpleNamespace as Click
+    shown = []
+    saved_popup = widget.popup_menu
+    widget.popup_menu = lambda x, y, menu=None: shown.extend(
+        menu.entrycget(i, "label") for i in range(menu.index("end") + 1)
+        if menu.type(i) == "command")
+    widget.on_right_click(Click(widget=widget.rows[1].title, x_root=0, y_root=0))
+    widget.popup_menu = saved_popup
+    assert "나중에 다시 확인" in shown and "방금 확인함에서 빼기" in shown, shown
+    widget.forget_checked("local_a")
+    assert widget.checked == []
     assert widget.rows[0].cget("text") == "확인할 세션이 없음"
 
     # Leaving the list: opened by the widget just now -> 확인함, otherwise
