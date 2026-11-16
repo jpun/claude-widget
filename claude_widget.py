@@ -233,6 +233,10 @@ HEADER_CLASS = "hide-focus-ring"
 SIDEBAR_NAME = "사이드바"
 SIDEBAR_CLASS = "dframe-sidebar"
 STATUS_CLASS = "sr-only"
+# Later builds (5.11492) dropped the tooltip: the status is a text of its own
+# in the title label, after the title. A fork's "…에서 포크됨" sits there too,
+# so only the app's own status words count.
+TITLE_LABEL_CLASS = "dframe-fade-label"
 FOLDER_CLASS = "df-meta-place"
 # The line under the title: Claude's summary of the session, then the folder.
 META_CLASS = "df-meta-slots"
@@ -500,6 +504,9 @@ def parse_row_parts(parts: list[tuple[str, str]]) -> tuple[str, str, str]:
         if not text:
             continue
         if STATUS_CLASS in classes and not status:
+            status = text
+        elif TITLE_LABEL_CLASS in classes and not status \
+                and (text in STATUS_KINDS or text in OTHER_ORDER):
             status = text
         elif FOLDER_CLASS in classes and not folder:
             folder = text
@@ -3163,6 +3170,16 @@ def self_check() -> None:
     running = [("세션", " dframe-fade-label"),
                ("실행 중", " dframe-fade-label sr-only")]
     assert parse_row_parts(running) == ("실행 중", "", "")
+    # 5.11492: no tooltip, the status is a text of the title label; a fork's
+    # note there is not a status.
+    label_status = [("클로드위젯", " dframe-fade-label"),
+                    ("실행 중", " dframe-fade-label"),
+                    ("Reading a file", " df-meta-slots shrink-0"),
+                    ("desk", " df-meta-slots df-meta-place shrink-0")]
+    assert parse_row_parts(label_status) == ("실행 중", "desk", "Reading a file")
+    fork_note = [("빠른 실행 - 데스크", " dframe-fade-label"),
+                 ("dev-standard에서 포크됨", " dframe-fade-label")]
+    assert parse_row_parts(fork_note) == ("", "", "")
     # Older build: no folder slot, folder last on the meta line.
     older = [("데스크", " dframe-fade-label"),
              ("main", " df-meta-line shrink-0"), ("desk", " df-meta-line shrink-0")]
